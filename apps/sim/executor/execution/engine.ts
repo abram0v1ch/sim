@@ -1,6 +1,6 @@
 import { createLogger } from '@sim/logger'
 import { isExecutionCancelled, isRedisCancellationEnabled } from '@/lib/execution/cancellation'
-import { BlockType } from '@/executor/constants'
+import { BlockType, DEFAULTS } from '@/executor/constants'
 import type { DAG } from '@/executor/dag/builder'
 import type { EdgeManager } from '@/executor/execution/edge-manager'
 import { serializePauseSnapshot } from '@/executor/execution/snapshot-serializer'
@@ -34,6 +34,8 @@ export class ExecutionEngine {
   private readonly CANCELLATION_CHECK_INTERVAL_MS = 500
   private abortPromise: Promise<void> | null = null
   private abortResolve: (() => void) | null = null
+  private runningParallelBranchCount = 0
+  private readonly maxParallelConcurrent = DEFAULTS.MAX_PARALLEL_CONCURRENT
 
   constructor(
     private context: ExecutionContext,
@@ -211,7 +213,7 @@ export class ExecutionEngine {
     return this.readyQueue.shift()
   }
 
-  private trackExecution(promise: Promise<void>): void {
+  private trackExecution(promise: Promise<void>, onFinally?: () => void): void {
     const trackedPromise = promise
       .catch((error) => {
         if (!this.errorFlag) {
@@ -221,6 +223,7 @@ export class ExecutionEngine {
       })
       .finally(() => {
         this.executing.delete(trackedPromise)
+        onFinally?.()
       })
     this.executing.add(trackedPromise)
   }
@@ -345,6 +348,11 @@ export class ExecutionEngine {
     }
   }
 
+  /**
+   * Drains ready queue and starts node executions. Parallel-branch nodes are
+   * capped at maxParallelConcurrent (see DEFAULTS.MAX_PARALLEL_CONCURRENT);
+   * when at limit, the node is re-queued and we wait for one to finish.
+   */
   private async processQueue(): Promise<void> {
     while (this.readyQueue.length > 0) {
       if ((await this.checkCancellation()) || this.errorFlag) {
@@ -352,8 +360,26 @@ export class ExecutionEngine {
       }
       const nodeId = this.dequeue()
       if (!nodeId) continue
+
+      const node = this.dag.nodes.get(nodeId)
+      const isParallelBranch = node?.metadata?.isParallelBranch === true
+      if (
+        isParallelBranch &&
+        this.runningParallelBranchCount >= this.maxParallelConcurrent
+      ) {
+        this.readyQueue.unshift(nodeId)
+        break
+      }
+
+      if (isParallelBranch) {
+        this.runningParallelBranchCount++
+      }
       const promise = this.executeNodeAsync(nodeId)
-      this.trackExecution(promise)
+      this.trackExecution(promise, () => {
+        if (isParallelBranch) {
+          this.runningParallelBranchCount--
+        }
+      })
     }
 
     if (this.executing.size > 0 && !this.cancelledFlag && !this.errorFlag) {

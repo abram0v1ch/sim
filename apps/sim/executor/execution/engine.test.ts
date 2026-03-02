@@ -15,6 +15,7 @@ import { isExecutionCancelled, isRedisCancellationEnabled } from '@/lib/executio
 import type { DAG, DAGNode } from '@/executor/dag/builder'
 import type { EdgeManager } from '@/executor/execution/edge-manager'
 import type { NodeExecutionOrchestrator } from '@/executor/orchestrators/node'
+import { DEFAULTS } from '@/executor/constants'
 import type { ExecutionContext } from '@/executor/types'
 import type { SerializedBlock } from '@/serializer/types'
 import { ExecutionEngine } from './engine'
@@ -1001,6 +1002,65 @@ describe('ExecutionEngine', () => {
       await engine.run('node0')
 
       expect((isExecutionCancelled as Mock).mock.calls.length).toBeLessThanOrEqual(3)
+    })
+  })
+
+  describe('Parallel concurrency limit', () => {
+    it('should cap concurrent parallel-branch executions at MAX_PARALLEL_CONCURRENT', async () => {
+      const limit = DEFAULTS.MAX_PARALLEL_CONCURRENT
+      const branchCount = limit + 5
+
+      const startNode = createMockNode('start', 'starter')
+      const branchNodes = Array.from({ length: branchCount }, (_, i) => {
+        const node = createMockNode(`branch${i}`, 'function')
+        node.metadata = { isParallelBranch: true, parallelId: 'parallel-1' }
+        return node
+      })
+
+      branchNodes.forEach((_, i) => {
+        startNode.outgoingEdges.set(`edge${i}`, { target: `branch${i}` })
+      })
+
+      const dag = createMockDAG([startNode, ...branchNodes])
+      const context = createMockContext()
+
+      const edgeManager = createMockEdgeManager((node) => {
+        if (node.id === 'start') {
+          return branchNodes.map((_, i) => `branch${i}`)
+        }
+        return []
+      })
+
+      let concurrentCount = 0
+      let maxConcurrent = 0
+      const executedBranchIds: string[] = []
+
+      const nodeOrchestrator = {
+        executionCount: 0,
+        executeNode: vi.fn().mockImplementation(async (_ctx: ExecutionContext, nodeId: string) => {
+          const node = dag.nodes.get(nodeId)
+          if (node?.metadata?.isParallelBranch) {
+            concurrentCount++
+            maxConcurrent = Math.max(maxConcurrent, concurrentCount)
+            executedBranchIds.push(nodeId)
+            try {
+              await new Promise((resolve) => setTimeout(resolve, 20))
+              return { nodeId, output: {}, isFinalOutput: false }
+            } finally {
+              concurrentCount--
+            }
+          }
+          return { nodeId, output: {}, isFinalOutput: false }
+        }),
+        handleNodeCompletion: vi.fn(),
+      } as unknown as MockNodeOrchestrator
+
+      const engine = new ExecutionEngine(context, dag, edgeManager, nodeOrchestrator)
+      const result = await engine.run('start')
+
+      expect(result.success).toBe(true)
+      expect(executedBranchIds).toHaveLength(branchCount)
+      expect(maxConcurrent).toBeLessThanOrEqual(limit)
     })
   })
 })

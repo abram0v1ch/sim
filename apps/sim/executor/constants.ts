@@ -158,6 +158,13 @@ export const DEFAULTS = {
   MAX_LOOP_ITERATIONS: 1000,
   MAX_FOREACH_ITEMS: 1000,
   MAX_PARALLEL_BRANCHES: 20,
+  /**
+   * Max number of parallel-branch nodes executing concurrently per run.
+   * Enforced in-memory in the executor (no Redis). Scope is per workflow run only;
+   * multiple runs or replicas do not share the limit. Chosen for simplicity and
+   * easy tuning. A Redis-backed global cap can be added later if needed.
+   */
+  MAX_PARALLEL_CONCURRENT: 10,
   MAX_SSE_CHILD_DEPTH: 3,
   EXECUTION_TIME: 0,
   TOKENS: {
